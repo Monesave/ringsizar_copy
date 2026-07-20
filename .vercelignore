@@ -1,0 +1,7 @@
+node_modules
+.next
+*.log
+dev.log
+dev-out.log
+dev-err.log
+.vercel
