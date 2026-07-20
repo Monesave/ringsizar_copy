@@ -2,7 +2,7 @@
 
 import React, { useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { signIn, signInWithGoogle } from '@/lib/supabase/auth';
+import { signIn } from '@/lib/supabase/auth';
 
 export default function SignInPage() {
   const router = useRouter();
@@ -22,16 +22,6 @@ export default function SignInPage() {
       setLoading(false);
     } else {
       router.push('/');
-    }
-  };
-
-  const handleGoogleSignIn = async () => {
-    setLoading(true);
-    setError(null);
-    const { error } = await signInWithGoogle();
-    if (error) {
-      setError(error.message);
-      setLoading(false);
     }
   };
 
@@ -78,34 +68,15 @@ export default function SignInPage() {
           <button
             type="submit"
             disabled={loading}
-            className="w-full py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-400"
+            className="w-full py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-400 font-semibold"
           >
             {loading ? 'Signing in...' : 'Sign In'}
           </button>
         </form>
 
-        <div className="mt-6">
-          <div className="relative">
-            <div className="absolute inset-0 flex items-center">
-              <div className="w-full border-t border-gray-300"></div>
-            </div>
-            <div className="relative flex justify-center text-sm">
-              <span className="px-2 bg-white text-gray-500">Or continue with</span>
-            </div>
-          </div>
-
-          <button
-            onClick={handleGoogleSignIn}
-            disabled={loading}
-            className="mt-4 w-full py-3 border border-gray-300 rounded-lg hover:bg-gray-50 disabled:bg-gray-100"
-          >
-            Sign in with Google
-          </button>
-        </div>
-
         <p className="mt-6 text-center text-sm text-gray-600">
           Don't have an account?{' '}
-          <a href="/auth/signup" className="text-blue-600 hover:underline">
+          <a href="/auth/signup" className="text-blue-600 hover:underline font-semibold">
             Sign up
           </a>
         </p>
