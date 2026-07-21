@@ -307,43 +307,84 @@ export function validateCoinPixels(coinPixels: number): MeasurementError | null 
 
 // ─── Coin placement guide overlay ─────────────────────────────────────────────
 
-/**
- * Draw a dashed circle guide on the overlay canvas to show where to place the coin.
- * cx, cy = center of guide circle in canvas pixels.
- * radiusPx = expected coin radius in pixels (estimated from a typical distance).
- */
 export function drawCoinGuide(
   ctx: CanvasRenderingContext2D,
   cx: number,
   cy: number,
   radiusPx: number,
-  isCalibrated: boolean
+  isCalibrated: boolean,
+  coinName?: string,
+  diameterMm?: number
 ) {
   ctx.save();
 
-  // Outer dashed circle
-  ctx.strokeStyle = isCalibrated ? '#00FF00' : '#FFD700';
-  ctx.lineWidth = 2;
-  ctx.setLineDash([6, 4]);
+  // Subtle translucent fill inside guide ring
+  ctx.fillStyle = isCalibrated ? 'rgba(16, 185, 129, 0.15)' : 'rgba(245, 158, 11, 0.15)';
   ctx.beginPath();
-  ctx.arc(cx, cy, radiusPx, 0, Math.PI * 2);
+  ctx.arc(cx, cy, Math.max(1, radiusPx), 0, Math.PI * 2);
+  ctx.fill();
+
+  // Outer guide ring stroke
+  ctx.strokeStyle = isCalibrated ? '#10B981' : '#F59E0B';
+  ctx.lineWidth = 3;
+  ctx.setLineDash(isCalibrated ? [] : [6, 4]);
+  ctx.beginPath();
+  ctx.arc(cx, cy, Math.max(1, radiusPx), 0, Math.PI * 2);
   ctx.stroke();
+
+  // Left & right edge handle dots
+  const handleRadius = 6;
+  const leftX = cx - radiusPx;
+  const rightX = cx + radiusPx;
+
+  [leftX, rightX].forEach((hx) => {
+    ctx.save();
+    ctx.fillStyle = isCalibrated ? '#10B981' : '#F59E0B';
+    ctx.beginPath();
+    ctx.arc(hx, cy, handleRadius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.restore();
+  });
 
   // Cross-hair center
   ctx.setLineDash([]);
-  ctx.lineWidth = 1;
-  ctx.strokeStyle = isCalibrated ? '#00FF00' : '#FFD700';
-  const ch = 8;
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = isCalibrated ? '#10B981' : '#F59E0B';
+  const ch = 10;
   ctx.beginPath();
   ctx.moveTo(cx - ch, cy); ctx.lineTo(cx + ch, cy);
   ctx.moveTo(cx, cy - ch); ctx.lineTo(cx, cy + ch);
   ctx.stroke();
 
-  // Label
-  ctx.fillStyle = isCalibrated ? '#00FF00' : '#FFD700';
-  ctx.font = 'bold 11px sans-serif';
+  // Dimension badge below circle
+  const diameterPx = Math.round(radiusPx * 2);
+  const mmText = diameterMm ? `${diameterMm.toFixed(1)} mm` : '';
+  const labelText = isCalibrated
+    ? `✓ Scale Calibrated: ${mmText} (${diameterPx} px)`
+    : `Fit coin to ring ${mmText ? `— ${mmText}` : ''}`;
+
+  ctx.font = 'bold 12px sans-serif';
+  const textWidth = ctx.measureText(labelText).width;
+  const badgeW = textWidth + 24;
+  const badgeH = 26;
+  const badgeY = cy + radiusPx + 14;
+
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+  if (typeof (ctx as any).roundRect === 'function') {
+    ctx.beginPath();
+    (ctx as any).roundRect(cx - badgeW / 2, badgeY, badgeW, badgeH, 13);
+    ctx.fill();
+  } else {
+    ctx.fillRect(cx - badgeW / 2, badgeY, badgeW, badgeH);
+  }
+
+  ctx.fillStyle = isCalibrated ? '#34D399' : '#FBBF24';
   ctx.textAlign = 'center';
-  ctx.fillText(isCalibrated ? '✓ Coin calibrated' : 'Place coin here', cx, cy + radiusPx + 16);
+  ctx.textBaseline = 'middle';
+  ctx.fillText(labelText, cx, badgeY + badgeH / 2);
 
   ctx.restore();
 }

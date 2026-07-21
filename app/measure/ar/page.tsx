@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation';
 import { useCamera } from '@/hooks/useCamera';
 import { HandTracker, type HandDetection } from '@/lib/mediapipe/handTracker';
 import { AROverlay } from '@/components/ar/AROverlay';
-import { drawScanLine, drawCoinGuide, validateCoinPixels, type MeasurementError } from '@/utils/fingerMeasurement';
+import { drawScanLine, drawCoinGuide, validateCoinPixels } from '@/utils/fingerMeasurement';
 import { convertFingerWidthToRingSize, validateMeasurement } from '@/utils/fingerDetection';
 import { convertDiameterToSizes } from '@/utils/ringSize/converter';
 import { COIN_OPTIONS, type CoinCalibration, type LocalMeasurement } from '@/types/measurement';
@@ -16,8 +16,8 @@ import { getCurrentUser } from '@/lib/supabase/auth';
 type AppStep = 'coin-setup' | 'coin-click' | 'measure' | 'result';
 
 /**
- * Explicit interaction mode — the single source of truth for whether
- * canvas pointer events are active. Coin calibration = clicks allowed.
+ * Interaction mode — single source of truth for canvas pointer events.
+ * Coin calibration = clicks allowed.
  * Measurement = fully automatic, zero clicks accepted.
  */
 type InteractionMode = 'coin_calibration' | 'measurement';
@@ -26,17 +26,81 @@ function stepToMode(step: AppStep): InteractionMode {
   return step === 'coin-click' ? 'coin_calibration' : 'measurement';
 }
 
+// ── Top Progress Stepper ───────────────────────────────────────────────────
+function StepProgressBar({ currentStep }: { currentStep: AppStep }) {
+  const steps: { key: AppStep; label: string; num: number }[] = [
+    { key: 'coin-setup', label: 'Reference Coin', num: 1 },
+    { key: 'coin-click', label: 'Mark Circle', num: 2 },
+    { key: 'measure', label: 'Measure Finger', num: 3 },
+    { key: 'result', label: 'Ring Size', num: 4 },
+  ];
+
+  const getStepStatus = (stepKey: AppStep) => {
+    const order: AppStep[] = ['coin-setup', 'coin-click', 'measure', 'result'];
+    const currentIdx = order.indexOf(currentStep);
+    const stepIdx = order.indexOf(stepKey);
+    if (stepIdx < currentIdx) return 'completed';
+    if (stepIdx === currentIdx) return 'active';
+    return 'upcoming';
+  };
+
+  return (
+    <div className="w-full bg-white border-b border-gray-200 px-4 py-2.5 shadow-sm sticky top-0 z-30">
+      <div className="max-w-xl mx-auto flex items-center justify-between">
+        {steps.map((s, idx) => {
+          const status = getStepStatus(s.key);
+          return (
+            <React.Fragment key={s.key}>
+              <div className="flex items-center gap-1.5">
+                <div
+                  className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold transition-all ${
+                    status === 'completed'
+                      ? 'bg-emerald-600 text-white'
+                      : status === 'active'
+                      ? 'bg-blue-600 text-white ring-2 ring-blue-200'
+                      : 'bg-gray-100 text-gray-400'
+                  }`}
+                >
+                  {status === 'completed' ? '✓' : s.num}
+                </div>
+                <span
+                  className={`text-xs font-medium hidden sm:inline ${
+                    status === 'active'
+                      ? 'text-blue-600 font-semibold'
+                      : status === 'completed'
+                      ? 'text-gray-700'
+                      : 'text-gray-400'
+                  }`}
+                >
+                  {s.label}
+                </span>
+              </div>
+              {idx < steps.length - 1 && (
+                <div
+                  className={`flex-1 h-0.5 mx-2 ${
+                    getStepStatus(steps[idx + 1].key) !== 'upcoming'
+                      ? 'bg-emerald-500'
+                      : 'bg-gray-200'
+                  }`}
+                />
+              )}
+            </React.Fragment>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export default function ARMeasurementPage() {
   const router = useRouter();
   const { videoRef, isActive, hasPermission, error: cameraError, startCamera, requestPermission } = useCamera();
 
-  // Stable ref so the useEffect cleanup always disposes the latest instance
   const handTrackerRef = useRef<HandTracker | null>(null);
   const [isInitialized, setIsInitialized] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  // Hidden canvas used to capture a single video frame for pixel analysis
   const frameCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const [step, setStep] = useState<AppStep>('coin-setup');
@@ -53,7 +117,7 @@ export default function ARMeasurementPage() {
   const [uploadedImage, setUploadedImage] = useState<HTMLImageElement | null>(null);
   const [useUpload, setUseUpload] = useState(false);
 
-  // Result state — passed via React state, not URL
+  // Result state
   const [result, setResult] = useState<LocalMeasurement | null>(null);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saved' | 'error'>('idle');
 
@@ -61,7 +125,6 @@ export default function ARMeasurementPage() {
   const [captureError, setCaptureError] = useState<string | null>(null);
   const [draggingCoinIdx, setDraggingCoinIdx] = useState<number | null>(null);
 
-  // Derived — never set manually, always computed from step
   const interactionMode: InteractionMode = stepToMode(step);
 
   // ── Initialize MediaPipe ──────────────────────────────────────────────────
@@ -77,13 +140,12 @@ export default function ARMeasurementPage() {
       });
 
     return () => {
-      // Always disposes the correct instance via ref
       handTrackerRef.current?.dispose();
       handTrackerRef.current = null;
     };
   }, []);
 
-  // ── Start camera once coin calibration is done ────────────────────────────
+  // ── Start camera once step requires video ──────────────────────────────────
   useEffect(() => {
     if (step !== 'measure' && step !== 'coin-click') return;
     if (useUpload) return;
@@ -94,7 +156,7 @@ export default function ARMeasurementPage() {
     }
   }, [step, useUpload, hasPermission, requestPermission, startCamera]);
 
-  // ── Ensure hidden frame canvas exists ────────────────────────────────────
+  // ── Hidden frame canvas ────────────────────────────────────────────────────
   useEffect(() => {
     if (!frameCanvasRef.current) {
       frameCanvasRef.current = document.createElement('canvas');
@@ -111,7 +173,7 @@ export default function ARMeasurementPage() {
     return option.diameterMm;
   };
 
-  // ── Coin canvas coordinate helper ─────────────────────────────────────────
+  // ── Canvas coordinate helper ──────────────────────────────────────────────
   const getCanvasCoords = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas) return null;
@@ -128,7 +190,6 @@ export default function ARMeasurementPage() {
     if (!coinDiameterMm) return;
     const coinPixels = Math.hypot(clicks[1].x - clicks[0].x, clicks[1].y - clicks[0].y);
 
-    // Validate coin pixel span before accepting
     const coinErr = validateCoinPixels(coinPixels);
     if (coinErr) {
       setCaptureError(coinErr.message);
@@ -136,25 +197,21 @@ export default function ARMeasurementPage() {
     }
 
     const pixelsPerMm = coinPixels / coinDiameterMm;
-    const mmPerPixel  = coinDiameterMm / coinPixels; // finger_mm = finger_px × mmPerPixel
+    const mmPerPixel  = coinDiameterMm / coinPixels;
     setCoinCalibration({ coinDiameterMm, coinPixels, pixelsPerMm, mmPerPixel });
-    // Pass mmPerPixel to HandTracker so widthMm is computed correctly
     handTrackerRef.current?.setCalibrationFactor(mmPerPixel);
     setCaptureError(null);
   }, [coinOptionIdx, customCoinMm]);
 
-  // ── Handle coin click on canvas ───────────────────────────────────────────
-  // ONLY fires during coin_calibration mode. The canvas has pointer-events-none
-  // in measurement mode so this handler is never reached, but we guard here too
-  // as a second layer of enforcement.
+  // ── Handle coin click / drag on canvas ────────────────────────────────────
   const handleCoinCanvasClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (interactionMode !== 'coin_calibration') return; // hard gate — ignore all non-coin clicks
+    if (interactionMode !== 'coin_calibration') return;
     const pt = getCanvasCoords(e);
     if (!pt) return;
 
-    // If clicking near an existing point (within 12px), start drag instead
+    // If clicking near an existing point (within 18px), drag it
     const hitIdx = coinClicks.findIndex(
-      (c) => Math.hypot(c.x - pt.x, c.y - pt.y) < 12
+      (c) => Math.hypot(c.x - pt.x, c.y - pt.y) < 18
     );
     if (hitIdx !== -1) {
       setDraggingCoinIdx(hitIdx);
@@ -162,7 +219,6 @@ export default function ARMeasurementPage() {
     }
 
     setCoinClicks((prev) => {
-      // If both points placed, replace the older one
       if (prev.length >= 2) {
         const next = [prev[1], pt];
         commitCoinCalibration(next);
@@ -190,14 +246,47 @@ export default function ARMeasurementPage() {
     setDraggingCoinIdx(null);
   }, []);
 
-  // ── Draw coin guide + click markers on overlay canvas ───────────────────────────
+  // ── Spawn default target ring centered on canvas ──────────────────────────
+  const handleInitializeDefaultRing = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const cx = canvas.width * 0.5;
+    const cy = canvas.height * 0.5;
+    const defaultRadius = Math.round(canvas.width * 0.12);
+    const defaultClicks = [
+      { x: Math.round(cx - defaultRadius), y: Math.round(cy) },
+      { x: Math.round(cx + defaultRadius), y: Math.round(cy) },
+    ];
+    setCoinClicks(defaultClicks);
+    commitCoinCalibration(defaultClicks);
+  };
+
+  // ── Slider span change handler ─────────────────────────────────────────────
+  const handleSliderSpanChange = (newSpanPx: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    let cx = canvas.width * 0.5;
+    let cy = canvas.height * 0.5;
+    if (coinClicks.length >= 2) {
+      cx = (coinClicks[0].x + coinClicks[1].x) / 2;
+      cy = (coinClicks[0].y + coinClicks[1].y) / 2;
+    }
+    const halfSpan = newSpanPx / 2;
+    const newClicks = [
+      { x: Math.round(Math.max(10, cx - halfSpan)), y: Math.round(cy) },
+      { x: Math.round(Math.min(canvas.width - 10, cx + halfSpan)), y: Math.round(cy) },
+    ];
+    setCoinClicks(newClicks);
+    commitCoinCalibration(newClicks);
+  };
+
+  // ── Draw coin guide + click markers on overlay canvas ─────────────────────
   useEffect(() => {
     if (step !== 'coin-click') return;
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext('2d');
     if (!ctx || !canvas) return;
 
-    // Size canvas to match video/image dimensions
     const video = videoRef.current;
     if (!useUpload && video && video.videoWidth > 0) {
       canvas.width  = video.videoWidth;
@@ -206,18 +295,49 @@ export default function ARMeasurementPage() {
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Coin placement guide circle (right-third of frame, vertically centered)
-    const guideR  = Math.round(canvas.width * 0.08); // ~8% of width ≈ typical coin radius
-    const guideCx = Math.round(canvas.width * 0.75);
-    const guideCy = Math.round(canvas.height * 0.5);
-    drawCoinGuide(ctx, guideCx, guideCy, guideR, coinCalibration !== null);
+    const coinDiameterMm = getCoinDiameterMm() ?? undefined;
+    const selectedOption = COIN_OPTIONS[coinOptionIdx];
 
-    if (coinClicks.length === 0) return;
+    if (coinClicks.length === 0) {
+      // Draw initial centered guide circle
+      const guideR  = Math.round(canvas.width * 0.1);
+      const guideCx = Math.round(canvas.width * 0.5);
+      const guideCy = Math.round(canvas.height * 0.5);
+      drawCoinGuide(ctx, guideCx, guideCy, guideR, false, selectedOption.label, coinDiameterMm);
+      return;
+    }
 
-    // Line between the two points
-    if (coinClicks.length === 2) {
+    if (coinClicks.length === 1) {
+      // Draw point 1 marker + guide circle around it
+      const pt1 = coinClicks[0];
+      const guideR = Math.round(canvas.width * 0.1);
+      drawCoinGuide(ctx, pt1.x, pt1.y, guideR, false, selectedOption.label, coinDiameterMm);
+
       ctx.save();
-      ctx.strokeStyle = '#FFD700';
+      ctx.fillStyle = '#F59E0B';
+      ctx.beginPath();
+      ctx.arc(pt1.x, pt1.y, 7, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#FFFFFF';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.restore();
+      return;
+    }
+
+    if (coinClicks.length === 2) {
+      // Both points defined: calculate center, radius, distance
+      const mx = (coinClicks[0].x + coinClicks[1].x) / 2;
+      const my = (coinClicks[0].y + coinClicks[1].y) / 2;
+      const dist = Math.hypot(coinClicks[1].x - coinClicks[0].x, coinClicks[1].y - coinClicks[0].y);
+      const radius = dist / 2;
+
+      // Draw dynamic calibration circle overlay
+      drawCoinGuide(ctx, mx, my, radius, coinCalibration !== null, selectedOption.label, coinDiameterMm);
+
+      // Draw dashed diameter line across coin
+      ctx.save();
+      ctx.strokeStyle = coinCalibration ? '#10B981' : '#F59E0B';
       ctx.lineWidth = 2;
       ctx.setLineDash([5, 4]);
       ctx.beginPath();
@@ -225,40 +345,40 @@ export default function ARMeasurementPage() {
       ctx.lineTo(coinClicks[1].x, coinClicks[1].y);
       ctx.stroke();
 
-      const mx   = (coinClicks[0].x + coinClicks[1].x) / 2;
-      const my   = (coinClicks[0].y + coinClicks[1].y) / 2;
-      const dist = Math.hypot(coinClicks[1].x - coinClicks[0].x, coinClicks[1].y - coinClicks[0].y);
+      // Readout badge at midpoint
       ctx.setLineDash([]);
-      ctx.fillStyle = 'rgba(0,0,0,0.65)';
-      ctx.fillRect(mx - 36, my - 20, 72, 18);
-      ctx.fillStyle = '#FFD700';
+      const labelStr = `${dist.toFixed(1)} px`;
       ctx.font = 'bold 11px monospace';
+      const textW = ctx.measureText(labelStr).width;
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
+      ctx.fillRect(mx - textW / 2 - 8, my - 24, textW + 16, 20);
+      ctx.fillStyle = coinCalibration ? '#34D399' : '#FBBF24';
       ctx.textAlign = 'center';
-      ctx.fillText(`${dist.toFixed(1)} px`, mx, my - 6);
+      ctx.fillText(labelStr, mx, my - 10);
       ctx.restore();
+
+      // Point edge markers 1 & 2
+      coinClicks.forEach((pt, i) => {
+        ctx.save();
+        ctx.strokeStyle = coinCalibration ? '#10B981' : '#F59E0B';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, 9, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.fillStyle = coinCalibration ? '#10B981' : '#F59E0B';
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = 'bold 9px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(String(i + 1), pt.x, pt.y + 3);
+        ctx.restore();
+      });
     }
+  }, [coinClicks, step, coinCalibration, coinOptionIdx, customCoinMm, useUpload, videoRef]);
 
-    // Point markers
-    coinClicks.forEach((pt, i) => {
-      ctx.save();
-      ctx.strokeStyle = '#FFD700';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.arc(pt.x, pt.y, 10, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.fillStyle = '#FFD700';
-      ctx.beginPath();
-      ctx.arc(pt.x, pt.y, 6, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#000';
-      ctx.font = 'bold 10px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText(String(i + 1), pt.x, pt.y + 4);
-      ctx.restore();
-    });
-  }, [coinClicks, step, coinCalibration, useUpload, videoRef]);
-
-  // ── Capture frame from video or uploaded image ────────────────────────────
+  // ── Capture frame for measurement ─────────────────────────────────────────
   const captureFrame = useCallback((): CanvasRenderingContext2D | null => {
     const fc = frameCanvasRef.current;
     if (!fc) return null;
@@ -284,11 +404,11 @@ export default function ARMeasurementPage() {
   const handleCapture = async () => {
     const tracker = handTrackerRef.current;
     if (!tracker || !isInitialized) {
-      setCaptureError('Hand tracking not ready yet.');
+      setCaptureError('Hand tracking model not initialized yet.');
       return;
     }
     if (!coinCalibration) {
-      setCaptureError('Coin calibration required.');
+      setCaptureError('Coin calibration required before measuring.');
       return;
     }
 
@@ -298,19 +418,18 @@ export default function ARMeasurementPage() {
     try {
       const frameCtx = captureFrame();
       if (!frameCtx) {
-        setCaptureError('Could not capture image frame.');
+        setCaptureError('Could not capture frame from camera or upload.');
         setIsCapturing(false);
         return;
       }
 
-      // Detect hands from the uploaded photo (IMAGE mode) or the live video.
       let detections: HandDetection[];
       if (useUpload && uploadedImage) {
         detections = await tracker.detectImage(uploadedImage);
       } else {
         const source = videoRef.current;
         if (!source) {
-          setCaptureError('No video source available.');
+          setCaptureError('No video feed available.');
           setIsCapturing(false);
           return;
         }
@@ -318,7 +437,7 @@ export default function ARMeasurementPage() {
       }
 
       if (detections.length === 0) {
-        setCaptureError('No hand detected. Make sure your hand is clearly visible.');
+        setCaptureError('No hand detected in frame. Please align your hand clearly.');
         setIsCapturing(false);
         return;
       }
@@ -327,7 +446,6 @@ export default function ARMeasurementPage() {
         (d) => d.handedness.toLowerCase() === selectedHand
       ) ?? detections[0];
 
-      // measureFingerWidth now uses real pixel data from the captured frame
       const measureResult = tracker.measureFingerWidth(detection, selectedFinger, frameCtx);
 
       if (!measureResult.ok) {
@@ -338,11 +456,8 @@ export default function ARMeasurementPage() {
 
       const { measurement } = measureResult;
 
-      // Draw scan line on overlay canvas for visual feedback
       const overlayCtx = canvasRef.current?.getContext('2d');
       if (overlayCtx && canvasRef.current) {
-        // For uploads, AROverlay's video-driven loop never sized the canvas —
-        // match it to the image so the scan line lands in the right place.
         if (useUpload && uploadedImage) {
           canvasRef.current.width = uploadedImage.naturalWidth;
           canvasRef.current.height = uploadedImage.naturalHeight;
@@ -354,8 +469,8 @@ export default function ARMeasurementPage() {
 
       if (!validateMeasurement(ringMeasurement)) {
         setCaptureError(
-          `Measurement out of valid range (${ringMeasurement.diameterMm.toFixed(1)} mm). ` +
-          'Ensure good lighting, plain background, and coin is in the same frame.'
+          `Measurement (${ringMeasurement.diameterMm.toFixed(1)} mm) is outside valid ring range. ` +
+          'Ensure good lighting and keep finger flat.'
         );
         setIsCapturing(false);
         return;
@@ -381,7 +496,6 @@ export default function ARMeasurementPage() {
       setResult(localResult);
       setStep('result');
 
-      // Auto-save if user is signed in — fire and forget
       getCurrentUser().then((user) => {
         if (user) saveMeasurement(localResult)
           .then(({ error }) => setSaveStatus(error ? 'error' : 'saved'))
@@ -389,7 +503,7 @@ export default function ARMeasurementPage() {
       });
     } catch (e) {
       console.error('Capture error:', e);
-      setCaptureError('Unexpected error. Please try again.');
+      setCaptureError('An unexpected error occurred during measurement.');
     } finally {
       setIsCapturing(false);
     }
@@ -412,28 +526,26 @@ export default function ARMeasurementPage() {
   };
 
   // ─────────────────────────────────────────────────────────────────────────
-  // RENDER
+  // RENDER VIEWS
   // ─────────────────────────────────────────────────────────────────────────
 
   if (initError) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-screen p-4 text-center">
-        <p className="text-red-600 text-lg mb-4">{initError}</p>
-        <button onClick={() => window.location.reload()} className="px-6 py-3 bg-blue-600 text-white rounded-lg">
-          Reload
-        </button>
+      <div className="flex flex-col items-center justify-center min-h-screen p-4 text-center bg-gray-50">
+        <div className="bg-red-50 border border-red-200 rounded-xl p-6 max-w-md">
+          <p className="text-red-700 font-semibold mb-3">{initError}</p>
+          <button onClick={() => window.location.reload()} className="px-6 py-2.5 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700">
+            Reload Page
+          </button>
+        </div>
       </div>
     );
   }
 
-  // ── Step: result ──────────────────────────────────────────────────────────
+  // ── Step: Result ──────────────────────────────────────────────────────────
   if (step === 'result' && result) {
     const fingerLabels: Record<string, string> = {
-      thumb: 'Thumb',
-      index: 'Index Finger',
-      middle: 'Middle Finger',
-      ring: 'Ring Finger',
-      little: 'Little Finger',
+      thumb: 'Thumb', index: 'Index Finger', middle: 'Middle Finger', ring: 'Ring Finger', little: 'Little Finger',
     };
     const handLabel = result.hand
       ? result.hand.charAt(0).toUpperCase() + result.hand.slice(1) + ' Hand'
@@ -441,13 +553,14 @@ export default function ARMeasurementPage() {
     const fingerLabel = result.finger ? fingerLabels[result.finger] : null;
 
     return (
-      <div className="min-h-screen bg-gray-50 p-4">
-        <div className="max-w-lg mx-auto">
-          <h1 className="text-2xl font-bold mb-6">Your Ring Size</h1>
+      <div className="min-h-screen bg-gray-50 flex flex-col">
+        <StepProgressBar currentStep="result" />
+        <div className="max-w-lg mx-auto p-4 flex-1 w-full pb-24">
+          <h1 className="text-2xl font-bold mb-4 text-gray-900">Your Ring Size Results</h1>
 
-          <div className="bg-white rounded-xl shadow p-6 mb-4 space-y-4">
+          <div className="bg-white rounded-xl shadow-md p-6 mb-4 space-y-4 border border-gray-100">
             {(handLabel || fingerLabel) && (
-              <div className="flex gap-4 pb-3 border-b">
+              <div className="flex gap-4 pb-3 border-b border-gray-100">
                 {handLabel && (
                   <div className="flex items-center gap-2">
                     <span className="text-xl">✋</span>
@@ -470,58 +583,57 @@ export default function ARMeasurementPage() {
             )}
 
             <div className="grid grid-cols-2 gap-4 text-center">
-              <div className="bg-blue-50 rounded-lg p-4">
-                <p className="text-xs text-gray-500 mb-1">Diameter</p>
-                <p className="text-2xl font-bold text-blue-700">{result.innerDiameterMm.toFixed(2)} mm</p>
+              <div className="bg-blue-50/80 rounded-xl p-4 border border-blue-100">
+                <p className="text-xs font-medium text-blue-600 mb-1">Inner Diameter</p>
+                <p className="text-2xl font-extrabold text-blue-800">{result.innerDiameterMm.toFixed(2)} <span className="text-sm font-normal">mm</span></p>
               </div>
-              <div className="bg-blue-50 rounded-lg p-4">
-                <p className="text-xs text-gray-500 mb-1">Circumference</p>
-                <p className="text-2xl font-bold text-blue-700">{result.innerCircumferenceMm.toFixed(2)} mm</p>
+              <div className="bg-blue-50/80 rounded-xl p-4 border border-blue-100">
+                <p className="text-xs font-medium text-blue-600 mb-1">Inner Circumference</p>
+                <p className="text-2xl font-extrabold text-blue-800">{result.innerCircumferenceMm.toFixed(2)} <span className="text-sm font-normal">mm</span></p>
               </div>
             </div>
 
-            <div className="grid grid-cols-4 gap-2 text-center pt-2 border-t">
+            <div className="grid grid-cols-4 gap-2 text-center pt-3 border-t border-gray-100">
               {[
                 { label: 'US', value: result.sizeUS },
                 { label: 'EU', value: result.sizeEU },
                 { label: 'UK/AU', value: result.sizeUK_AU_NZ },
                 { label: 'JP/CN', value: result.sizeJP_CN },
               ].map(({ label, value }) => (
-                <div key={label}>
-                  <p className="text-xs text-gray-500">{label}</p>
-                  <p className="text-xl font-bold">{value}</p>
+                <div key={label} className="bg-gray-50 p-2.5 rounded-lg border border-gray-100">
+                  <p className="text-xs text-gray-500 font-medium">{label}</p>
+                  <p className="text-lg font-bold text-gray-900">{value}</p>
                 </div>
               ))}
             </div>
           </div>
 
-          <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 mb-6 text-xs text-yellow-800">
-            Finger size can vary with temperature and time of day. Measure at room temperature for best accuracy.
+          <div className="bg-amber-50 border border-amber-200 rounded-xl p-3.5 mb-4 text-xs text-amber-800 flex items-start gap-2">
+            <span className="text-base">💡</span>
+            <p>Finger size varies slightly with temperature and time of day. Measure at room temperature for best ring fit.</p>
           </div>
 
           {saveStatus === 'saved' && (
-            <div className="bg-green-50 border border-green-200 rounded-lg p-3 mb-4 flex items-center gap-2 text-sm text-green-700">
-              <span>✓</span> Measurement saved to your profile.
+            <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3.5 mb-4 flex items-center gap-2 text-sm text-emerald-800 font-medium">
+              <span>✓</span> Saved to your profile measurements.
             </div>
           )}
-          {saveStatus === 'error' && (
-            <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-4 text-sm text-red-700">
-              Could not save measurement. Please check your connection.
-            </div>
-          )}
+        </div>
 
-          <div className="flex gap-3">
+        {/* STICKY BOTTOM ACTION BAR */}
+        <div className="fixed bottom-0 left-0 right-0 p-4 bg-white/95 backdrop-blur-md border-t border-gray-200 shadow-xl z-30">
+          <div className="max-w-lg mx-auto flex gap-3">
             <button
-              onClick={() => { setStep('coin-setup'); setResult(null); setCoinCalibration(null); }}
-              className="flex-1 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+              onClick={() => { setStep('coin-setup'); setResult(null); setCoinCalibration(null); setCoinClicks([]); }}
+              className="flex-1 py-3 bg-blue-600 text-white font-semibold rounded-xl hover:bg-blue-700 shadow-sm transition-all"
             >
               Measure Again
             </button>
             <button
               onClick={() => router.push('/')}
-              className="flex-1 py-3 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300"
+              className="flex-1 py-3 bg-gray-100 text-gray-700 font-semibold rounded-xl hover:bg-gray-200 transition-all"
             >
-              Home
+              Back to Home
             </button>
           </div>
         </div>
@@ -529,7 +641,7 @@ export default function ARMeasurementPage() {
     );
   }
 
-  // ── Step: coin-setup ──────────────────────────────────────────────────────
+  // ── Step 1: Coin Setup ────────────────────────────────────────────────────
   if (step === 'coin-setup') {
     const selectedOption = COIN_OPTIONS[coinOptionIdx];
     const isCustom = selectedOption.diameterMm === 0;
@@ -538,93 +650,160 @@ export default function ARMeasurementPage() {
       : true;
 
     return (
-      <div className="min-h-screen bg-gray-50 p-4">
-        <div className="max-w-lg mx-auto">
-          <button onClick={() => router.push('/')} className="mb-4 text-sm text-gray-500 hover:text-gray-700">
-            ← Back
-          </button>
-          <h1 className="text-2xl font-bold mb-2">Step 1 — Select Reference Coin</h1>
-          <p className="text-gray-500 text-sm mb-6">
-            Place a coin next to your finger in the frame. We'll use it to calculate real-world scale.
-          </p>
+      <div className="min-h-screen bg-gray-50 flex flex-col">
+        <StepProgressBar currentStep="coin-setup" />
 
-          <div className="bg-white rounded-xl shadow p-5 space-y-4 mb-6">
-            <label className="block text-sm font-medium text-gray-700">Coin type</label>
-            <div className="space-y-2">
+        <div className="max-w-lg mx-auto p-4 flex-1 w-full pb-28">
+          <div className="mb-4">
+            <h1 className="text-2xl font-bold text-gray-900 mb-1">Step 1 — Select Reference Coin</h1>
+            <p className="text-gray-600 text-sm">
+              Place a coin next to your finger in the frame to calibrate pixel scale.
+            </p>
+          </div>
+
+          {/* VISUAL COIN REFERENCE CARD */}
+          <div className="bg-gradient-to-r from-blue-600 to-indigo-700 text-white rounded-2xl p-4 mb-5 shadow-md flex items-center justify-between">
+            <div>
+              <p className="text-xs text-blue-200 font-medium uppercase tracking-wider mb-0.5">Selected Scale Reference</p>
+              <h3 className="text-lg font-bold flex items-center gap-2">
+                <span>{selectedOption.icon}</span> {selectedOption.label}
+              </h3>
+              <p className="text-xs text-blue-100 mt-1">
+                {isCustom
+                  ? customCoinMm ? `Diameter: ${customCoinMm} mm` : 'Enter custom diameter below'
+                  : `Real-world diameter: ${selectedOption.diameterMm} mm`}
+              </p>
+            </div>
+            <div className="w-14 h-14 rounded-full border-2 border-dashed border-white/60 flex items-center justify-center bg-white/10 shrink-0">
+              <span className="text-xs font-bold text-white">
+                {isCustom ? (customCoinMm || '?') : selectedOption.diameterMm}mm
+              </span>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-5 space-y-4 mb-5">
+            <label className="block text-sm font-semibold text-gray-800">Choose your coin currency / type</label>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 max-h-64 overflow-y-auto pr-1">
               {COIN_OPTIONS.map((opt, i) => (
-                <label key={i} className="flex items-center gap-3 cursor-pointer">
-                  <input
-                    type="radio"
-                    name="coin"
-                    checked={coinOptionIdx === i}
-                    onChange={() => setCoinOptionIdx(i)}
-                    className="accent-blue-600"
-                  />
-                  <span className="text-sm">{opt.label}</span>
-                </label>
+                <button
+                  key={i}
+                  type="button"
+                  onClick={() => setCoinOptionIdx(i)}
+                  className={`flex items-center gap-3 p-3 rounded-xl border text-left transition-all ${
+                    coinOptionIdx === i
+                      ? 'border-blue-600 bg-blue-50/70 text-blue-900 font-medium ring-2 ring-blue-500/20'
+                      : 'border-gray-200 hover:border-gray-300 hover:bg-gray-50 text-gray-700'
+                  }`}
+                >
+                  <span className="text-xl shrink-0">{opt.icon}</span>
+                  <span className="text-xs leading-tight flex-1">{opt.label}</span>
+                </button>
               ))}
             </div>
 
             {isCustom && (
-              <div>
-                <label className="block text-xs text-gray-500 mb-1">Custom diameter (mm)</label>
+              <div className="pt-2 border-t border-gray-100">
+                <label className="block text-xs font-medium text-gray-700 mb-1">Custom Coin Diameter (mm)</label>
                 <input
                   type="number"
                   value={customCoinMm}
                   onChange={(e) => setCustomCoinMm(e.target.value)}
                   placeholder="e.g. 21.5"
                   min="5"
-                  max="50"
+                  max="60"
                   step="0.1"
-                  className="w-full px-3 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  className="w-full px-3.5 py-2.5 border border-gray-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
               </div>
             )}
 
-            <div className="border-t pt-4">
-              <label className="block text-sm font-medium text-gray-700 mb-2">Or upload an image</label>
+            <div className="border-t border-gray-100 pt-4">
+              <label className="block text-sm font-semibold text-gray-800 mb-1.5">Or upload photo from gallery</label>
               <input
                 type="file"
                 accept="image/*"
                 onChange={handleImageUpload}
-                className="text-sm text-gray-600 file:mr-3 file:py-1 file:px-3 file:rounded file:border-0 file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
+                className="text-xs text-gray-600 file:mr-3 file:py-2 file:px-3.5 file:rounded-xl file:border-0 file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 cursor-pointer"
               />
               {uploadedImage && (
-                <p className="text-xs text-green-600 mt-1">✓ Image loaded ({uploadedImage.naturalWidth}×{uploadedImage.naturalHeight})</p>
+                <p className="text-xs text-emerald-600 mt-1 font-medium flex items-center gap-1">
+                  <span>✓</span> Loaded photo ({uploadedImage.naturalWidth} × {uploadedImage.naturalHeight} px)
+                </p>
               )}
             </div>
           </div>
 
-          <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-6 text-xs text-blue-800 space-y-1">
-            <p className="font-semibold">Instructions:</p>
-            <p>1. Place the coin flat next to your ring finger (top-down view)</p>
-            <p>2. Keep your hand still and well-lit</p>
-            <p>3. On the next screen, click the left and right edges of the coin</p>
+          <div className="bg-blue-50/80 border border-blue-200/70 rounded-xl p-4 text-xs text-blue-900 space-y-1.5">
+            <p className="font-semibold text-blue-950 flex items-center gap-1">
+              <span>📋</span> Next Step Instructions:
+            </p>
+            <p>1. Place your coin flat next to your finger in the frame.</p>
+            <p>2. On the next screen, align the circle overlay to your coin's outer diameter.</p>
           </div>
+        </div>
 
-          <button
-            disabled={!canProceed}
-            onClick={() => setStep('coin-click')}
-            className="w-full py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed font-semibold"
-          >
-            Next — Mark Coin Edges
-          </button>
+        {/* STICKY BOTTOM ACTION BAR */}
+        <div className="fixed bottom-0 left-0 right-0 p-4 bg-white/95 backdrop-blur-md border-t border-gray-200 shadow-xl z-30">
+          <div className="max-w-lg mx-auto flex items-center gap-3">
+            <button
+              onClick={() => router.push('/')}
+              className="px-4 py-3 bg-gray-100 text-gray-700 font-semibold rounded-xl hover:bg-gray-200 text-sm transition-all"
+            >
+              ← Home
+            </button>
+            <button
+              disabled={!canProceed}
+              onClick={() => setStep('coin-click')}
+              className="flex-1 py-3 bg-blue-600 text-white font-semibold rounded-xl hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed text-sm shadow-md transition-all flex items-center justify-center gap-1"
+            >
+              <span>Next — Mark Scale Circle</span>
+              <span>→</span>
+            </button>
+          </div>
         </div>
       </div>
     );
   }
 
-  // ── Step: coin-click ──────────────────────────────────────────────────────
+  // ── Step 2: Coin Click / Circle Alignment ──────────────────────────────────
   if (step === 'coin-click') {
+    const selectedOption = COIN_OPTIONS[coinOptionIdx];
+    const coinDiameterMm = getCoinDiameterMm();
+    const currentSpanPx = coinClicks.length === 2
+      ? Math.round(Math.hypot(coinClicks[1].x - coinClicks[0].x, coinClicks[1].y - coinClicks[0].y))
+      : 180;
+
     return (
-      <div className="flex flex-col min-h-screen bg-black">
-        <div className="relative flex-1">
+      <div className="flex flex-col min-h-screen bg-gray-950 text-white">
+        <StepProgressBar currentStep="coin-click" />
+
+        {/* TOP STEP INSTRUCTION BANNER */}
+        <div className="bg-gray-900/90 border-b border-gray-800 px-4 py-2.5 text-center text-xs sm:text-sm font-medium z-20">
+          {coinClicks.length === 0 && (
+            <span className="text-amber-300 flex items-center justify-center gap-1.5">
+              <span>📍</span> Step 1 of 2: Tap the <strong>LEFT edge</strong> of your coin (or tap "Preset Circle Ring" below)
+            </span>
+          )}
+          {coinClicks.length === 1 && (
+            <span className="text-amber-300 flex items-center justify-center gap-1.5">
+              <span>📍</span> Step 2 of 2: Tap the <strong>RIGHT edge</strong> of your coin
+            </span>
+          )}
+          {coinClicks.length === 2 && (
+            <span className="text-emerald-300 flex items-center justify-center gap-1.5">
+              <span>✓</span> Scale Circle Calibrated ({coinDiameterMm} mm = {currentSpanPx} px). Adjust with slider if needed.
+            </span>
+          )}
+        </div>
+
+        <div className="relative flex-1 bg-black flex items-center justify-center overflow-hidden">
           {useUpload && uploadedImage ? (
             // eslint-disable-next-line @next/next/no-img-element
             <img
               src={uploadedImage.src}
-              alt="uploaded"
-              className="w-full h-full object-contain"
+              alt="uploaded photo"
+              className="w-full h-full object-contain max-h-[70vh]"
             />
           ) : (
             <video
@@ -632,79 +811,142 @@ export default function ARMeasurementPage() {
               autoPlay
               playsInline
               muted
-              className="w-full h-full object-cover"
+              className="w-full h-full object-cover max-h-[70vh]"
             />
           )}
+
           <canvas
             ref={canvasRef}
-            className="absolute inset-0 w-full h-full cursor-crosshair"
+            className="absolute inset-0 w-full h-full cursor-crosshair touch-none"
             onClick={handleCoinCanvasClick}
             onMouseMove={handleCoinCanvasMouseMove}
             onMouseUp={handleCoinCanvasMouseUp}
             onMouseLeave={handleCoinCanvasMouseUp}
           />
-          <div className="absolute top-3 left-0 right-0 flex justify-center">
-            <div className="bg-black/70 text-white text-sm px-4 py-2 rounded-full">
-              {coinClicks.length === 0
-                ? 'Click the LEFT edge of the coin'
-                : 'Click the RIGHT edge of the coin'}
-            </div>
-          </div>
         </div>
-        <div className="bg-white p-3 flex gap-3">
-          <button
-            onClick={() => { setCoinClicks([]); setStep('coin-setup'); }}
-            className="flex-1 py-2 bg-gray-200 text-gray-700 rounded-lg text-sm"
-          >
-            Back
-          </button>
-          {coinClicks.length > 0 && (
-            <button
-              onClick={() => setCoinClicks([])}
-              className="flex-1 py-2 bg-yellow-100 text-yellow-800 rounded-lg text-sm"
-            >
-              Reset clicks
-            </button>
+
+        {/* INTERACTIVE CIRCLE DIAMETER CONTROLS */}
+        <div className="bg-gray-900 border-t border-gray-800 p-3 text-xs z-20 space-y-2">
+          {coinClicks.length < 2 ? (
+            <div className="flex items-center justify-between max-w-lg mx-auto">
+              <span className="text-gray-400">Can't tap exact edges easily?</span>
+              <button
+                onClick={handleInitializeDefaultRing}
+                className="px-3 py-1.5 bg-amber-500/20 text-amber-300 border border-amber-500/40 rounded-lg hover:bg-amber-500/30 transition-all font-medium"
+              >
+                🎯 Place Target Ring Overlay
+              </button>
+            </div>
+          ) : (
+            <div className="max-w-lg mx-auto flex items-center gap-3">
+              <span className="text-gray-400 whitespace-nowrap">Circle Span:</span>
+              <input
+                type="range"
+                min="80"
+                max="400"
+                value={currentSpanPx}
+                onChange={(e) => handleSliderSpanChange(Number(e.target.value))}
+                className="flex-1 accent-emerald-500 cursor-pointer"
+              />
+              <span className="font-mono text-emerald-400 font-bold min-w-[55px] text-right">{currentSpanPx} px</span>
+            </div>
           )}
-          {coinCalibration && (
+        </div>
+
+        {captureError && (
+          <div className="bg-red-900/80 border-t border-red-700 text-red-200 px-4 py-2 text-xs text-center">
+            {captureError}
+          </div>
+        )}
+
+        {/* STICKY BOTTOM ACTION BAR */}
+        <div className="bg-gray-950 p-4 border-t border-gray-800 z-30 sticky bottom-0">
+          <div className="max-w-lg mx-auto flex items-center gap-2.5">
             <button
+              onClick={() => { setCoinClicks([]); setStep('coin-setup'); }}
+              className="py-3 px-4 bg-gray-800 text-gray-300 rounded-xl text-xs font-semibold hover:bg-gray-700 transition-all"
+            >
+              ← Back
+            </button>
+
+            {coinClicks.length > 0 && (
+              <button
+                onClick={() => { setCoinClicks([]); setCoinCalibration(null); }}
+                className="py-3 px-3.5 bg-gray-800 text-amber-400 rounded-xl text-xs font-semibold hover:bg-gray-700 transition-all"
+              >
+                Reset
+              </button>
+            )}
+
+            <button
+              disabled={!coinCalibration}
               onClick={() => setStep('measure')}
-              className="flex-1 py-2 bg-blue-600 text-white rounded-lg text-sm font-semibold"
+              className={`flex-1 py-3 px-4 rounded-xl text-xs font-semibold shadow-lg transition-all flex items-center justify-center gap-1.5 ${
+                coinCalibration
+                  ? 'bg-emerald-600 hover:bg-emerald-500 text-white ring-2 ring-emerald-400/30'
+                  : 'bg-gray-800 text-gray-500 cursor-not-allowed'
+              }`}
             >
-              ✓ Confirm ({coinCalibration.mmPerPixel.toFixed(4)} mm/px)
+              {coinCalibration ? (
+                <>
+                  <span>✓ Next: Measure Finger</span>
+                  <span>→</span>
+                </>
+              ) : (
+                <span>Mark 2 edges to enable Next</span>
+              )}
             </button>
-          )}
+          </div>
         </div>
       </div>
     );
   }
 
-  // ── Step: measure ─────────────────────────────────────────────────────────
+  // ── Step 3: Finger Measure ────────────────────────────────────────────────
   if (hasPermission === false && !useUpload) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-screen p-4 text-center">
-        <h2 className="text-xl font-bold mb-3">Camera Permission Required</h2>
-        {cameraError && <p className="text-red-600 mb-3 text-sm">{cameraError}</p>}
-        <button onClick={requestPermission} className="px-6 py-3 bg-blue-600 text-white rounded-lg">
-          Grant Permission
-        </button>
+      <div className="flex flex-col items-center justify-center min-h-screen p-4 text-center bg-gray-50">
+        <StepProgressBar currentStep="measure" />
+        <div className="max-w-md bg-white p-6 rounded-2xl shadow-md border border-gray-200 mt-8">
+          <h2 className="text-xl font-bold mb-3 text-gray-900">Camera Access Needed</h2>
+          <p className="text-sm text-gray-600 mb-5">Please allow camera access to enable AR finger detection.</p>
+          {cameraError && <p className="text-red-600 mb-4 text-xs bg-red-50 p-2.5 rounded-lg">{cameraError}</p>}
+          <button onClick={requestPermission} className="w-full py-3 bg-blue-600 text-white rounded-xl font-semibold hover:bg-blue-700 shadow-md">
+            Grant Camera Permission
+          </button>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col min-h-screen">
-      <div className="relative flex-1 bg-black">
+    <div className="flex flex-col min-h-screen bg-gray-950 text-white">
+      <StepProgressBar currentStep="measure" />
+
+      {/* TOP STATUS BANNER */}
+      <div className="bg-gray-900/90 border-b border-gray-800 px-4 py-2 text-center text-xs font-medium z-20 flex items-center justify-between max-w-xl mx-auto w-full">
+        <span className="text-emerald-400 flex items-center gap-1.5">
+          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+          Automatic detection active
+        </span>
+        {coinCalibration && (
+          <span className="text-gray-300 font-mono text-[11px] bg-gray-800 px-2 py-0.5 rounded-full">
+            🪙 {coinCalibration.coinDiameterMm} mm ({coinCalibration.mmPerPixel.toFixed(3)} mm/px)
+          </span>
+        )}
+      </div>
+
+      <div className="relative flex-1 bg-black flex items-center justify-center overflow-hidden">
         {useUpload && uploadedImage ? (
           // eslint-disable-next-line @next/next/no-img-element
-          <img src={uploadedImage.src} alt="uploaded" className="w-full h-full object-contain" />
+          <img src={uploadedImage.src} alt="uploaded" className="w-full h-full object-contain max-h-[70vh]" />
         ) : (
           <video
             ref={videoRef}
             autoPlay
             playsInline
             muted
-            className="w-full h-full object-cover"
+            className="w-full h-full object-cover max-h-[70vh]"
             style={{ display: isActive ? 'block' : 'none' }}
           />
         )}
@@ -725,85 +967,74 @@ export default function ARMeasurementPage() {
         />
 
         {isCapturing && (
-          <div className="absolute inset-0 bg-black/70 flex items-center justify-center">
-            <div className="text-white text-center">
-              <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-white mx-auto mb-3" />
-              <p>Measuring...</p>
+          <div className="absolute inset-0 bg-black/75 flex items-center justify-center z-30">
+            <div className="text-white text-center p-6 bg-gray-900/90 rounded-2xl border border-gray-800 backdrop-blur-md shadow-2xl">
+              <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-blue-400 mx-auto mb-3" />
+              <p className="font-semibold text-sm">Analyzing Finger Dimensions...</p>
             </div>
-          </div>
-        )}
-
-        {/* Mode badge — always visible so user knows clicks do nothing here */}
-        <div className="absolute top-3 left-0 right-0 flex justify-center pointer-events-none">
-          <div className="bg-black/60 text-white text-xs px-3 py-1 rounded-full flex items-center gap-1.5">
-            <span className="w-2 h-2 rounded-full bg-green-400 inline-block" />
-            Automatic detection — no clicking required
-          </div>
-        </div>
-
-        {coinCalibration && (
-          <div className="absolute top-10 right-3 bg-black/60 text-white text-xs px-3 py-1 rounded-full pointer-events-none">
-            🪙 {coinCalibration.coinDiameterMm} mm → {coinCalibration.mmPerPixel.toFixed(4)} mm/px
           </div>
         )}
       </div>
 
-      <div className="bg-white p-4 shadow-lg space-y-3">
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className="block text-xs font-medium text-gray-600 mb-1">Hand</label>
-            <select
-              value={selectedHand}
-              onChange={(e) => setSelectedHand(e.target.value as Hand)}
-              className="w-full p-2 border rounded-lg text-sm"
-            >
-              <option value="left">Left</option>
-              <option value="right">Right</option>
-            </select>
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-gray-600 mb-1">Finger</label>
-            <select
-              value={selectedFinger}
-              onChange={(e) => setSelectedFinger(e.target.value as Finger)}
-              className="w-full p-2 border rounded-lg text-sm"
-            >
-              <option value="thumb">Thumb</option>
-              <option value="index">Index</option>
-              <option value="middle">Middle</option>
-              <option value="ring">Ring</option>
-              <option value="little">Little</option>
-            </select>
-          </div>
+      {captureError && (
+        <div className="bg-red-900/90 border-t border-red-700 text-red-200 px-4 py-2.5 text-xs text-center font-medium z-20">
+          ⚠️ {captureError}
         </div>
+      )}
 
-        {captureError && (
-          <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2 text-sm text-red-700">
-            {captureError}
+      {/* STICKY BOTTOM CONTROL BAR */}
+      <div className="bg-gray-950 p-4 border-t border-gray-800 z-30 sticky bottom-0">
+        <div className="max-w-lg mx-auto space-y-3">
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-[11px] font-medium text-gray-400 mb-1">Target Hand</label>
+              <select
+                value={selectedHand}
+                onChange={(e) => setSelectedHand(e.target.value as Hand)}
+                className="w-full p-2.5 bg-gray-900 border border-gray-800 rounded-xl text-xs text-white focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="right font-medium">Right Hand</option>
+                <option value="left">Left Hand</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-[11px] font-medium text-gray-400 mb-1">Target Finger</label>
+              <select
+                value={selectedFinger}
+                onChange={(e) => setSelectedFinger(e.target.value as Finger)}
+                className="w-full p-2.5 bg-gray-900 border border-gray-800 rounded-xl text-xs text-white focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="ring">Ring Finger</option>
+                <option value="index">Index Finger</option>
+                <option value="middle">Middle Finger</option>
+                <option value="thumb">Thumb</option>
+                <option value="little">Little Finger</option>
+              </select>
+            </div>
           </div>
-        )}
 
-        <button
-          onClick={handleCapture}
-          disabled={isCapturing || !isInitialized || !coinCalibration}
-          className="w-full py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed font-semibold"
-        >
-          {isCapturing ? 'Measuring...' : 'Capture Measurement'}
-        </button>
+          <button
+            onClick={handleCapture}
+            disabled={isCapturing || !isInitialized || !coinCalibration}
+            className="w-full py-3.5 bg-blue-600 text-white font-bold rounded-xl hover:bg-blue-500 disabled:bg-gray-800 disabled:text-gray-500 disabled:cursor-not-allowed shadow-lg text-sm transition-all flex items-center justify-center gap-2"
+          >
+            <span>{isCapturing ? 'Processing...' : '📷 Capture Finger Measurement'}</span>
+          </button>
 
-        <div className="flex gap-2">
-          <button
-            onClick={() => { setStep('coin-setup'); setCoinCalibration(null); }}
-            className="flex-1 py-2 bg-gray-100 text-gray-600 rounded-lg text-sm hover:bg-gray-200"
-          >
-            Re-calibrate Coin
-          </button>
-          <button
-            onClick={() => router.push('/')}
-            className="flex-1 py-2 bg-gray-100 text-gray-600 rounded-lg text-sm hover:bg-gray-200"
-          >
-            Home
-          </button>
+          <div className="flex gap-2 text-xs">
+            <button
+              onClick={() => { setStep('coin-setup'); setCoinCalibration(null); setCoinClicks([]); }}
+              className="flex-1 py-2 bg-gray-900 text-gray-400 rounded-lg hover:bg-gray-800 hover:text-white transition-all text-center"
+            >
+              Re-calibrate Coin
+            </button>
+            <button
+              onClick={() => router.push('/')}
+              className="flex-1 py-2 bg-gray-900 text-gray-400 rounded-lg hover:bg-gray-800 hover:text-white transition-all text-center"
+            >
+              Home
+            </button>
+          </div>
         </div>
       </div>
     </div>
